@@ -14,7 +14,7 @@
 
 ## 用法
 
-默认自动读取系统默认网关、获取网关 MAC、开启 telnet、登录并读取超管：
+默认使用 `192.168.1.1`、从 ARP/邻居表获取该地址的 MAC、开启 telnet、登录并读取超管：
 
 ```bash
 ./hg5143f-superpass
@@ -98,6 +98,12 @@ http://192.168.1.1/cgi-bin/telnetenable.cgi?telnetenable=1&key=<MAC>
 
 ```text
 http://192.168.1.1/cgi-bin/telnetenable.cgi?telnetenable=1&key=24B7DA3B24E0
+```
+
+成功时返回 HTML，里面包含：
+
+```text
+document.writeln('telnet开启');
 ```
 
 ### 3. 登录 Telnet

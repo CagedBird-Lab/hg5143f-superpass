@@ -56,17 +56,6 @@ def sh(cmd: list[str]) -> str:
     return subprocess.check_output(cmd, text=True, timeout=3, stderr=subprocess.DEVNULL)
 
 
-def default_gateway() -> str:
-    try:
-        out = sh(["ip", "route", "show", "default"])
-    except Exception as exc:  # noqa: BLE001
-        raise ProbeError("cannot detect default gateway; pass host manually") from exc
-    m = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)\b", out)
-    if not m:
-        raise ProbeError("cannot parse default gateway; pass host manually")
-    return m.group(1)
-
-
 def gateway_mac(host: str) -> str:
     # Ensure neighbor entry exists.
     subprocess.run(["ping", "-c", "1", "-W", "1", host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -95,7 +84,10 @@ def enable_telnet(host: str, mac12: str, timeout: float) -> str:
         conn.request("GET", path)
         resp = conn.getresponse()
         body = resp.read(4096).decode("utf-8", errors="replace")
-        return f"HTTP {resp.status} {resp.reason}: {body.strip()}"
+        text = f"HTTP {resp.status} {resp.reason}: {body.strip()}"
+        if resp.status != 200 or "telnet开启" not in body:
+            raise ProbeError(f"telnet enable did not report success: {text}")
+        return text
     finally:
         conn.close()
 
@@ -244,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="hg5143f-superpass",
         description="Read CMCC HG5143F super-admin username/password from the local telnet shell.",
     )
-    p.add_argument("host", nargs="?", help="router IP; default: system default gateway")
+    p.add_argument("host", nargs="?", default="192.168.1.1", help="router IP, default: 192.168.1.1")
     p.add_argument("-p", "--port", type=int, default=23, help="telnet port, default: 23")
     p.add_argument("-t", "--timeout", type=float, default=5.0, help="per-command timeout seconds, default: 5")
     p.add_argument("--mac", help="router MAC; accepts 24:b7:da:3b:24:e0, 24-b7-da-3b-24-e0, or 24B7DA3B24E0")
@@ -255,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     try:
-        host = args.host or default_gateway()
+        host = args.host
         mac12 = normalize_mac(args.mac) if args.mac else gateway_mac(host)
         if not args.no_enable_telnet:
             enable_telnet(host, mac12, args.timeout)
