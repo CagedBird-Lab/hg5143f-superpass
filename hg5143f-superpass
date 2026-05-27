@@ -47,6 +47,7 @@ class Result:
     host: str
     login_user: str
     login_password: str
+    method: str
     username: str
     password: str
 
@@ -207,18 +208,23 @@ def fetch(host: str, port: int, timeout: float, login_user: str, login_password:
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.settimeout(timeout)
         login(sock, login_user, login_password, timeout)
-        # Prefer the factory CLI path from the original tutorial; fall back to cfg_cmd.
-        factory = run_cmd(sock, "load_cli factory", timeout)
-        name_out = run_cmd(sock, "show admin_name", timeout)
-        pwd_out = run_cmd(sock, "show admin_pwd", timeout)
-        admin_name = parse_show_value(name_out, "admin_name")
-        admin_pwd = parse_show_value(pwd_out, "admin_pwd")
-        if not (admin_name and admin_pwd) or "Unknown command" in factory + name_out + pwd_out:
-            run_cmd(sock, "exit", timeout)
-            user_out = run_cmd(sock, f"cfg_cmd get {USERNAME_FIELD}", timeout)
-            pass_out = run_cmd(sock, f"cfg_cmd get {PASSWORD_FIELD}", timeout)
+        # On the tested Ningbo Mobile HG5143F, `load_cli factory` returns
+        # "Permission denied" while cfg_cmd works directly from the # shell.
+        user_out = run_cmd(sock, f"cfg_cmd get {USERNAME_FIELD}", timeout)
+        pass_out = run_cmd(sock, f"cfg_cmd get {PASSWORD_FIELD}", timeout)
+        method = "cfg_cmd"
+        try:
             admin_name = parse_cfg_value(user_out, USERNAME_FIELD)
             admin_pwd = parse_cfg_value(pass_out, PASSWORD_FIELD)
+        except ProbeError:
+            factory = run_cmd(sock, "load_cli factory", timeout)
+            name_out = run_cmd(sock, "show admin_name", timeout)
+            pwd_out = run_cmd(sock, "show admin_pwd", timeout)
+            admin_name = parse_show_value(name_out, "admin_name")
+            admin_pwd = parse_show_value(pwd_out, "admin_pwd")
+            method = "load_cli"
+            if not (admin_name and admin_pwd) or re.search(r"Permission denied|Unknown command", factory + name_out + pwd_out, re.I):
+                raise ProbeError("both cfg_cmd and load_cli failed")
         try:
             send_line(sock, "exit")
         except OSError:
@@ -227,6 +233,7 @@ def fetch(host: str, port: int, timeout: float, login_user: str, login_password:
         host=host,
         login_user=login_user,
         login_password=login_password,
+        method=method,
         username=admin_name,
         password=admin_pwd,
     )
@@ -267,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"host={result.host}")
         print(f"login_user={result.login_user}")
         print(f"login_password={result.login_password}")
+        print(f"method={result.method}")
         print(f"username={result.username}")
         print(f"password={result.password}")
     return 0

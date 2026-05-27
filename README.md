@@ -118,21 +118,14 @@ MAC:  24B7DA3B24E0
 
 ### 4. 获取超级管理员账号
 
-脚本优先尝试：
+脚本默认直接使用实测可用的 `cfg_cmd`：
 
 ```text
-load_cli factory
-show admin_name
-show admin_pwd
-```
-
-如果返回 `Unknown command`，自动 fallback 到：
-
-```text
-exit
 cfg_cmd get InternetGatewayDevice.DeviceInfo.X_CMCC_TeleComAccount.Username
 cfg_cmd get InternetGatewayDevice.DeviceInfo.X_CMCC_TeleComAccount.Password
 ```
+
+在这台宁波移动 HG5143F 上，`load_cli factory` 会返回 `Permission denied`，所以它不作为默认路径。只有在 `cfg_cmd` 失败时，脚本才尝试 `load_cli factory / show admin_name / show admin_pwd` 作为 fallback。
 
 `get success!value=` 后面的内容就是超级管理员用户名和密码。
 
@@ -142,6 +135,7 @@ cfg_cmd get InternetGatewayDevice.DeviceInfo.X_CMCC_TeleComAccount.Password
 host=192.168.1.1
 login_user=admin
 login_password=Fh@XXXXXX
+method=cfg_cmd
 username=CMCCAdmin
 password=<device-specific-password>
 ```
